@@ -1,0 +1,32 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Vue
+web/node_modules/
+web/dist/
+
+# Data (contains secrets!)
+data/anotherbot.db
+data/stickers/
+data/logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# Claude
+.claude/
+
+# Docs (except user manual)
+docs/01-project-vision.md
+docs/02-requirements-spec.md
+docs/03-architecture-design.md
+docs/04-detailed-design.md
+
+# OS
+Thumbs.db
+.DS_Store

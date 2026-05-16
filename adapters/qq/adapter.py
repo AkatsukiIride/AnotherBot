@@ -1,0 +1,185 @@
+import asyncio
+import json
+import os
+import uuid
+import logging
+
+import websockets
+
+from adapters.base import BaseAdapter
+from models.message import (
+    AstrMessageEvent, AstrBotMessage, MessageComponent,
+    MessageType, MessageComponentType, MessageMember,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class QQAdapter(BaseAdapter):
+    """QQ platform adapter via OneBot v11 reverse WebSocket"""
+
+    def __init__(self, account_id: str, config: dict, queue):
+        super().__init__(account_id, config, queue)
+        self.ws_port = config.get('ws_port', 3001)
+        self.bot_qq = config.get('bot_qq', '')
+        self._server = None
+        self._client = None
+
+    def platform_name(self) -> str:
+        return "qq"
+
+    async def start(self) -> None:
+        self._running = True
+        self._server = await websockets.serve(
+            self._handle_connection,
+            "127.0.0.1", self.ws_port
+        )
+        logger.info(f"QQAdapter WS server listening on :{self.ws_port}")
+
+    async def _handle_connection(self, ws):
+        self._client = ws
+        logger.info("NapCat client connected")
+        self._broadcast_status("connected")
+        try:
+            async for raw in ws:
+                if not self._running:
+                    break
+                data = json.loads(raw)
+                if data.get('post_type') == 'message':
+                    event = self._to_event(data)
+                    await self.queue.enqueue(self.account_id, event)
+                elif data.get('post_type') == 'meta_event':
+                    pass  # heartbeat
+                elif data.get('post_type') == 'notice':
+                    pass  # log later
+        except websockets.exceptions.ConnectionClosed:
+            logger.warning("NapCat client disconnected")
+        finally:
+            self._client = None
+            self._broadcast_status("connecting")
+
+    def _broadcast_status(self, status: str):
+        try:
+            from api.system import broadcast_event
+            broadcast_event("status", {
+                "account_id": self.account_id,
+                "status": status,
+            })
+        except Exception:
+            pass
+
+    def _to_event(self, data: dict) -> AstrMessageEvent:
+        is_group = data.get('message_type') == 'group'
+        msg_type = MessageType.GROUP if is_group else MessageType.PRIVATE
+        group_id = str(data.get('group_id', ''))
+
+        message_str = ""
+        is_at = False
+        components = []
+
+        for seg in data.get('message', []):
+            seg_type = seg.get('type', '')
+            seg_data = seg.get('data', {})
+            if seg_type == 'text':
+                text = seg_data.get('text', '').strip()
+                message_str += text
+                components.append(MessageComponent(MessageComponentType.TEXT, seg_data))
+            elif seg_type == 'at':
+                if seg_data.get('qq') == self.bot_qq:
+                    is_at = True
+                components.append(MessageComponent(MessageComponentType.AT, seg_data))
+            elif seg_type == 'image':
+                components.append(MessageComponent(MessageComponentType.IMAGE, seg_data))
+
+        session_key = f"group_{group_id}" if is_group else f"private_{data.get('user_id', '')}"
+
+        sender_info = data.get('sender', {})
+        sender = MessageMember(
+            user_id=str(data.get('user_id', '')),
+            name=sender_info.get('card') or sender_info.get('nickname', '')
+        )
+
+        return AstrMessageEvent(
+            event_id=str(uuid.uuid4()),
+            account_id=self.account_id,
+            platform="qq",
+            message=AstrBotMessage(
+                message_str=message_str,
+                message_chain=components,
+                type=msg_type,
+                session_id=session_key,
+                group_id=group_id if is_group else None,
+                sender=sender,
+                is_at_bot=is_at,
+                raw_message=data,
+            )
+        )
+
+    async def send(self, event: AstrMessageEvent,
+                   reply_chain: list[MessageComponent]) -> bool:
+        if not self._client:
+            logger.warning("QQAdapter: no client connected, cannot send")
+            return False
+
+        onebot_chain = []
+        at_sender = False
+        for comp in reply_chain:
+            if comp.type == MessageComponentType.TEXT:
+                if event.message.type == MessageType.GROUP and not at_sender:
+                    onebot_chain.append({
+                        "type": "at",
+                        "data": {"qq": event.message.sender.user_id}
+                    })
+                    at_sender = True
+                onebot_chain.append({
+                    "type": "text",
+                    "data": {"text": comp.data.get('text', '')}
+                })
+            elif comp.type == MessageComponentType.IMAGE:
+                file_path = comp.data.get('file', '')
+                if file_path:
+                    file_path = os.path.abspath(file_path) if not os.path.isabs(file_path) else file_path
+                onebot_chain.append({
+                    "type": "image",
+                    "data": {"file": file_path}
+                })
+
+        if event.message.type == MessageType.GROUP:
+            action = "send_group_msg"
+            params = {"group_id": int(event.message.group_id), "message": onebot_chain}
+        else:
+            action = "send_private_msg"
+            params = {
+                "user_id": int(event.message.sender.user_id),
+                "message": onebot_chain
+            }
+
+        payload = {"action": action, "params": params}
+        try:
+            await self._client.send(json.dumps(payload, ensure_ascii=False))
+            return True
+        except websockets.exceptions.ConnectionClosed:
+            logger.error("QQAdapter: send failed, connection closed")
+            return False
+
+    async def stop(self) -> None:
+        self._running = False
+        if self._server:
+            self._server.close()
+            await self._server.wait_closed()
+            self._server = None
+
+    def status(self) -> dict:
+        connected = False
+        if self._client is not None and self._running:
+            try:
+                connected = self._client.state.name == 'OPEN'
+            except Exception:
+                connected = False
+        return {
+            "platform": "qq",
+            "bot_qq": self.bot_qq,
+            "ws_port": self.ws_port,
+            "connected": connected,
+            "running": self._running,
+        }
