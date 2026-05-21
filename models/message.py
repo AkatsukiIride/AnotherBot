@@ -36,6 +36,7 @@ class AstrBotMessage:
     group_id: Optional[str] = None
     sender: Optional[MessageMember] = None
     is_at_bot: bool = False
+    image_url: Optional[str] = None  # QQ image URL for vision
     raw_message: Optional[dict] = None
 
 

@@ -1,8 +1,8 @@
-import asyncio
 import json
 import os
 import uuid
 import logging
+from collections import OrderedDict
 
 import websockets
 
@@ -24,6 +24,10 @@ class QQAdapter(BaseAdapter):
         self.bot_qq = config.get('bot_qq', '')
         self._server = None
         self._client = None
+        # Recall: user_msg_id → (bot_msg_id, group_id|None)
+        self._replied_ids: OrderedDict[str, tuple[int, str | None]] = OrderedDict()
+        # Echo callbacks for async API response handling
+        self._echo_callbacks: dict[str, callable] = {}
 
     def platform_name(self) -> str:
         return "qq"
@@ -45,18 +49,45 @@ class QQAdapter(BaseAdapter):
                 if not self._running:
                     break
                 data = json.loads(raw)
-                if data.get('post_type') == 'message':
+                # API response (has echo/status, no post_type)
+                if 'post_type' not in data and 'echo' in data:
+                    cb = self._echo_callbacks.pop(data['echo'], None)
+                    if cb:
+                        cb(data)
+                    continue
+                post_type = data.get('post_type', '')
+                if post_type == 'message':
                     event = self._to_event(data)
                     await self.queue.enqueue(self.account_id, event)
-                elif data.get('post_type') == 'meta_event':
-                    pass  # heartbeat
-                elif data.get('post_type') == 'notice':
-                    pass  # log later
+                elif post_type == 'notice':
+                    await self._on_notice(data)
+                # meta_event → heartbeat, ignored
         except websockets.exceptions.ConnectionClosed:
             logger.warning("NapCat client disconnected")
         finally:
             self._client = None
             self._broadcast_status("connecting")
+
+    async def _on_notice(self, data: dict):
+        """Handle recall: if bot already replied, withdraw its reply."""
+        notice_type = data.get('notice_type', '')
+        if notice_type not in ('group_recall', 'friend_recall'):
+            return
+        user_msg_id = str(data.get('message_id', ''))
+        if not user_msg_id:
+            return
+
+        bot_info = self._replied_ids.pop(user_msg_id, None)
+        if bot_info and self._client:
+            bot_msg_id, group_id = bot_info
+            try:
+                await self._client.send(json.dumps({
+                    "action": "delete_msg",
+                    "params": {"message_id": bot_msg_id}
+                }, ensure_ascii=False))
+                logger.info(f"Withdrew bot reply {bot_msg_id} for recalled msg {user_msg_id}")
+            except Exception:
+                pass
 
     def _broadcast_status(self, status: str):
         try:
@@ -75,6 +106,7 @@ class QQAdapter(BaseAdapter):
 
         message_str = ""
         is_at = False
+        image_url = None
         components = []
 
         for seg in data.get('message', []):
@@ -89,6 +121,8 @@ class QQAdapter(BaseAdapter):
                     is_at = True
                 components.append(MessageComponent(MessageComponentType.AT, seg_data))
             elif seg_type == 'image':
+                if not image_url:
+                    image_url = seg_data.get('url', '')
                 components.append(MessageComponent(MessageComponentType.IMAGE, seg_data))
 
         session_key = f"group_{group_id}" if is_group else f"private_{data.get('user_id', '')}"
@@ -111,6 +145,7 @@ class QQAdapter(BaseAdapter):
                 group_id=group_id if is_group else None,
                 sender=sender,
                 is_at_bot=is_at,
+                image_url=image_url,
                 raw_message=data,
             )
         )
@@ -154,11 +189,26 @@ class QQAdapter(BaseAdapter):
                 "message": onebot_chain
             }
 
-        payload = {"action": action, "params": params}
+        echo = str(uuid.uuid4())[:8]
+        payload = {"action": action, "params": params, "echo": echo}
+
+        # Register callback to capture bot message_id for recall tracking
+        user_msg_id = str(event.message.raw_message.get('message_id', ''))
+        if user_msg_id:
+            def _on_response(resp: dict):
+                bot_msg_id = resp.get('data', {}).get('message_id', 0)
+                if bot_msg_id:
+                    self._replied_ids[user_msg_id] = (
+                        int(bot_msg_id), event.message.group_id)
+                    if len(self._replied_ids) > 200:
+                        self._replied_ids.popitem(last=False)
+            self._echo_callbacks[echo] = _on_response
+
         try:
             await self._client.send(json.dumps(payload, ensure_ascii=False))
             return True
         except websockets.exceptions.ConnectionClosed:
+            self._echo_callbacks.pop(echo, None)
             logger.error("QQAdapter: send failed, connection closed")
             return False
 

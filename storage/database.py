@@ -146,6 +146,35 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS bili_replied (
             item_id TEXT PRIMARY KEY
         );
+
+        CREATE TABLE IF NOT EXISTS user_memories (
+            id TEXT PRIMARY KEY,
+            session_key TEXT NOT NULL,
+            mem_key TEXT NOT NULL,
+            mem_value TEXT NOT NULL,
+            mem_type TEXT DEFAULT 'fact',
+            embedding TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(session_key, mem_key)
+        );
+
+        CREATE TABLE IF NOT EXISTS command_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            platform TEXT NOT NULL,
+            account_name TEXT NOT NULL,
+            command TEXT NOT NULL,
+            args TEXT DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_cmd_log_time ON command_logs(created_at);
+
+        CREATE TABLE IF NOT EXISTS learned_examples (
+            id TEXT PRIMARY KEY,
+            session_key TEXT NOT NULL,
+            user_msg TEXT NOT NULL,
+            bot_reply TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
     """)
     conn.commit()
     conn.close()

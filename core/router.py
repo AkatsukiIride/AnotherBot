@@ -39,10 +39,34 @@ class MessageRouter:
             reply = await handler.execute(event, args)
             adapter = self.adapters.get_adapter(event.account_id)
             if adapter:
-                await adapter.send(event, [MessageComponent(
-                    type=MessageComponentType.TEXT,
-                    data={"text": reply}
-                )])
+                if isinstance(reply, list):
+                    # Pre-built chain (from _roleplay_reply etc.): split and send
+                    txt = [c for c in reply if c.type == MessageComponentType.TEXT]
+                    imgs = [c for c in reply if c.type == MessageComponentType.IMAGE]
+                    if txt:
+                        await adapter.send(event, txt)
+                    for img in imgs:
+                        await asyncio.sleep(0.3)
+                        await adapter.send(event, [img])
+                elif isinstance(reply, dict) and 'image' in reply:
+                    # Legacy dict format
+                    chain = []
+                    if reply.get('text'):
+                        chain.append(MessageComponent(type=MessageComponentType.TEXT, data={"text": reply['text']}))
+                    chain.append(MessageComponent(type=MessageComponentType.IMAGE, data={"file": reply['image']}))
+                    await adapter.send(event, chain)
+                else:
+                    # String reply: route through sticker detection + split send
+                    text = str(reply)
+                    cmd_chain = self._build_reply_chain(text)
+                    txt = [c for c in cmd_chain if c.type == MessageComponentType.TEXT]
+                    imgs = [c for c in cmd_chain if c.type == MessageComponentType.IMAGE]
+                    if txt:
+                        await adapter.send(event, txt)
+                    for img in imgs:
+                        await asyncio.sleep(0.3)
+                        await adapter.send(event, [img])
+            self._log_command(event, cmd=event.get_message_str(), args=args)
             return
 
         # 2. Load account config (needed for SSE display)
@@ -61,7 +85,13 @@ class MessageRouter:
             "is_at_bot": event.message.is_at_bot,
             "timestamp": event.created_at.strftime("%H:%M:%S"),
         })
-        # 4. Gate: only react to @Bot or private messages
+        # 4. Vision capability: if message has image, auto-describe it
+        if event.message.image_url and event.message.image_url.startswith('http'):
+            description = await self._describe_image(event.message.image_url)
+            if description:
+                event.message.message_str = f"（用户发来一张图片，内容为：{description}。）\n{event.message.message_str}" if event.message.message_str else f"用户发来一张图片，内容为：{description}。"
+
+        # 5. Gate: only react to @Bot or private messages
         if not (event.message.is_at_bot or event.message.type == MessageType.PRIVATE):
             return
 
@@ -120,6 +150,17 @@ class MessageRouter:
             replace_sticker_block, system_prompt
         )
 
+        # Inject user memories and learned examples into system prompt
+        memory_hint = self._build_memory_hint(account)
+        learned_hint = self._build_learned_hint(account)
+        if memory_hint or learned_hint:
+            system_prompt += "\n\n---"
+            if memory_hint:
+                system_prompt += f"\n{memory_hint}"
+            if learned_hint:
+                system_prompt += f"\n{learned_hint}"
+            system_prompt += "\n---"
+
         # 8. Build messages for LLM
         messages = [{"role": "system", "content": system_prompt}]
         for msg in context_msgs:
@@ -130,13 +171,46 @@ class MessageRouter:
                 entry["reasoning_content"] = ""
             messages.append(entry)
 
-        # 9. Call LLM (stream → buffer → send once)
+        # 9. Call LLM → stream tokens and send sentence by sentence
         full_reply = []
+        adapter = self.adapters.get_adapter(event.account_id)
+        buffer = ""
         try:
             async for token in self.llm.chat_stream(messages, provider):
                 full_reply.append(token)
+                buffer += token
+                # Find last sentence boundary (。！？\n) with ≥30 chars accumulated
+                last_end = -1
+                for sep in ('。', '！', '？', '\n'):
+                    pos = buffer.rfind(sep)
+                    if pos > last_end:
+                        last_end = pos
+                if last_end >= 30 and adapter:
+                    chunk = buffer[:last_end+1]
+                    buffer = buffer[last_end+1:]
+                    chunk = self._clean_text(chunk)
+                    if chunk.strip():
+                        chain = self._build_reply_chain(chunk)
+                        if event.platform == 'bilibili':
+                            chain = [c for c in chain if c.type != MessageComponentType.IMAGE]
+                        await self._send_chain(adapter, event, chain)
         except Exception:
             full_reply = ["唔...我好像卡住了，再试一次？"]
+            buffer = "唔...我好像卡住了，再试一次？"
+
+        # Flush remaining buffer (final chunk with math rendering)
+        if buffer.strip():
+            chunk = self._clean_text(buffer)
+            math_images = []
+            if event.platform == 'qq':
+                chunk, math_images = self._render_math_in_text(chunk)
+            chain = self._build_reply_chain(chunk)
+            for img_path in math_images:
+                chain.append(MessageComponent(type=MessageComponentType.IMAGE, data={"file": img_path}))
+            if event.platform == 'bilibili':
+                chain = [c for c in chain if c.type != MessageComponentType.IMAGE]
+            if adapter:
+                await self._send_chain(adapter, event, chain)
 
         reply_text = "".join(full_reply)
         reply_reasoning = self.llm.last_reasoning
@@ -152,32 +226,9 @@ class MessageRouter:
             token_count=usage,
         )
 
-        # 12. Build reply chain and send
-        # Clean hallucinated non-EM sticker formats + Markdown images
-        clean_text = re.sub(r'\{[^}]*sticker[^}]*\}', '', reply_text)
-        clean_text = re.sub(r'\[sticker[^\]]*\]', '', clean_text)
-        clean_text = re.sub(r'!\[.*?\]\(https?://[^\s)]+\)', '', clean_text)
-        reply_chain = self._build_reply_chain(clean_text)
-        # B站: strip all images (danmaku/comments don't support custom images)
-        if event.platform == 'bilibili':
-            reply_chain = [c for c in reply_chain if c.type != MessageComponentType.IMAGE]
-        display_text = re.sub(r'\[?EM\d{4}\]?', '', clean_text).strip()
-
-        adapter = self.adapters.get_adapter(event.account_id)
+        # 12. Emit SSE
+        display_text = re.sub(r'\[?EM\d{4}\]?', '', reply_text).strip()
         if adapter:
-            # Split chain: send text parts as one message, each image separately
-            text_parts = [c for c in reply_chain if c.type == MessageComponentType.TEXT]
-            image_parts = [c for c in reply_chain if c.type == MessageComponentType.IMAGE]
-
-            if text_parts:
-                await adapter.send(event, text_parts)
-                # Brief pause between messages for natural feel
-                await asyncio.sleep(0.3)
-            for img in image_parts:
-                await adapter.send(event, [img])
-                await asyncio.sleep(0.3)
-
-            # Emit SSE: bot reply sent (clean text)
             broadcast_event("message", {
                 "account_name": account.get('name', ''),
                 "content": display_text or reply_text,
@@ -227,6 +278,24 @@ class MessageRouter:
             type=MessageComponentType.TEXT, data={"text": text}
         )]
 
+    def _clean_text(self, text: str) -> str:
+        """Strip hallucinated sticker formats and Markdown images."""
+        text = re.sub(r'\{[^}]*sticker[^}]*\}', '', text)
+        text = re.sub(r'\[sticker[^\]]*\]', '', text)
+        text = re.sub(r'!\[.*?\]\(https?://[^\s)]+\)', '', text)
+        return text
+
+    async def _send_chain(self, adapter, event, chain):
+        """Send a message chain: text parts together, images one by one."""
+        txt = [c for c in chain if c.type == MessageComponentType.TEXT]
+        imgs = [c for c in chain if c.type == MessageComponentType.IMAGE]
+        if txt:
+            await adapter.send(event, txt)
+            await asyncio.sleep(0.3)
+        for img in imgs:
+            await adapter.send(event, [img])
+            await asyncio.sleep(0.3)
+
     def _build_sticker_hint(self, codes: list[str] | None = None) -> str:
         """Build sticker list for System Prompt injection.
         If codes specified, only include those stickers."""
@@ -252,6 +321,154 @@ class MessageRouter:
             parts.append(f"[{r['code']}] | {desc}")
         parts.append("---")
         return "\n".join(parts)
+
+    async def _describe_image(self, image_url: str) -> str | None:
+        """Call vision model to describe an image"""
+        try:
+            import httpx
+            provider = self._get_vision_provider()
+            if not provider:
+                return None
+            body = {
+                "model": provider.model,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": image_url}},
+                        {"type": "text", "text": "用1-2句客观描述这张图片：画了什么人、什么动作、什么风格。不要加前缀引号，不要说'图中是'。"},
+                    ]
+                }],
+                "max_tokens": 100,
+                "temperature": 0.5,
+            }
+            headers = {"Authorization": f"Bearer {provider.api_key}", "Content-Type": "application/json"}
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                resp = await client.post(f"{provider.base_url}/chat/completions", json=body, headers=headers)
+                data = resp.json()
+                return data["choices"][0]["message"]["content"].strip()
+        except Exception:
+            return None
+
+    def _get_vision_provider(self):
+        """Get vision provider (system default)"""
+        db = get_db()
+        row = db.execute(
+            "SELECT * FROM providers WHERE category='vision' AND is_default=1 LIMIT 1"
+        ).fetchone()
+        db.close()
+        if row:
+            return self._row_to_provider(dict(row))
+        return None
+
+    def _build_memory_hint(self, account: dict) -> str:
+        """Inject stored memories into system prompt"""
+        persona_id = account.get('persona_id')
+        if not persona_id:
+            db = get_db()
+            row = db.execute("SELECT id FROM personas WHERE is_active=1 LIMIT 1").fetchone()
+            db.close()
+            persona_id = row['id'] if row else 'default'
+        sk = f"persona:{persona_id}"
+        db = get_db()
+        rows = db.execute(
+            "SELECT mem_key, mem_value FROM user_memories WHERE session_key=? ORDER BY created_at", (sk,)
+        ).fetchall()
+        db.close()
+        if not rows:
+            return ""
+        lines = ["角色设定:"]
+        for r in rows:
+            lines.append(f"  - {r['mem_key']}: {r['mem_value']}")
+        return "\n".join(lines)
+
+    def _build_learned_hint(self, account: dict) -> str:
+        """Inject learned examples as few-shot"""
+        persona_id = account.get('persona_id')
+        if not persona_id:
+            db = get_db()
+            row = db.execute("SELECT id FROM personas WHERE is_active=1 LIMIT 1").fetchone()
+            db.close()
+            persona_id = row['id'] if row else 'default'
+        sk = f"persona:{persona_id}"
+        db = get_db()
+        rows = db.execute(
+            "SELECT user_msg, bot_reply FROM learned_examples WHERE session_key=? ORDER BY created_at DESC LIMIT 5", (sk,)
+        ).fetchall()
+        db.close()
+        if not rows:
+            return ""
+        lines = ["历史优秀回复:"]
+        for r in rows:
+            lines.append(f"  👤 {r['user_msg']}")
+            lines.append(f"  🤖 {r['bot_reply']}")
+        return "\n".join(lines)
+
+    def _log_command(self, event: AstrMessageEvent, cmd: str, args: str):
+        try:
+            from storage.database import get_db
+            db = get_db()
+            row = db.execute("SELECT name FROM accounts WHERE id=?", (event.account_id,)).fetchone()
+            acc_name = row['name'] if row else '?'
+            cmd_name = cmd.split()[0] if cmd else '?'
+            db.execute(
+                "INSERT INTO command_logs (platform, account_name, command, args) VALUES (?,?,?,?)",
+                (event.platform, acc_name, cmd_name, args or '')
+            )
+            db.commit()
+            db.close()
+        except Exception:
+            pass
+
+    def _render_math_in_text(self, text: str) -> tuple[str, list[str]]:
+        """Detect $$...$$ and $...$ LaTeX, render ALL on ONE image. Returns (clean_text, [image_paths])"""
+        import os, uuid as _uuid
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+
+        formulas = []
+        clean_text = text
+        for pattern in [re.compile(r'\$\$\s*(.+?)\s*\$\$'), re.compile(r'\$(.+?)\$')]:
+            m = pattern.search(clean_text)
+            while m:
+                formula = m.group(1).strip()
+                if len(formula) >= 2:
+                    formulas.append(formula)
+                clean_text = clean_text[:m.start()] + clean_text[m.end():]
+                m = pattern.search(clean_text)
+        # Remove blank lines left by removed LaTeX
+        clean_text = re.sub(r'\n{2,}', '\n', clean_text)
+        clean_text = clean_text.strip()
+
+        if not formulas:
+            return clean_text, []
+
+        try:
+            n = len(formulas)
+            fig, ax = plt.subplots(figsize=(6, max(1.0, n * 0.7)))
+            ax.axis('off')
+            ax.set_xlim(0, 1)
+            ax.set_ylim(0, 1)
+            for i, f in enumerate(formulas):
+                y = 0.92 - i * (0.85 / max(n, 1))
+                ax.text(0.05, y, f'${f}$', fontsize=12, ha='left', va='center', transform=ax.transAxes)
+            os.makedirs('data/math_cache', exist_ok=True)
+            fpath = os.path.abspath(os.path.join('data/math_cache', f'math_{_uuid.uuid4().hex[:8]}.png'))
+            plt.savefig(fpath, dpi=120, bbox_inches='tight', facecolor='white', pad_inches=0.1)
+            plt.close()
+            # Limit file size: if >500KB, re-render at lower DPI
+            if os.path.getsize(fpath) > 512000:
+                fig2, ax2 = plt.subplots(figsize=(5, max(0.8, n * 0.5)))
+                ax2.axis('off')
+                for i, f in enumerate(formulas):
+                    ax2.text(0.05, 0.92 - i * (0.85 / max(n, 1)), f'${f}$', fontsize=11, ha='left', va='center', transform=ax2.transAxes)
+                plt.savefig(fpath, dpi=80, bbox_inches='tight', facecolor='white', pad_inches=0.1)
+                plt.close(fig2)
+            else:
+                plt.close()
+            return clean_text, [fpath]
+        except Exception:
+            return clean_text, []
 
     def _session_label(self, event: AstrMessageEvent) -> str:
         """Human-readable session label for SSE display"""

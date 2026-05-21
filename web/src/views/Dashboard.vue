@@ -37,6 +37,17 @@
       </div>
     </div>
 
+    <!-- 指令使用统计 -->
+    <div class="card">
+      <h3>指令使用统计</h3>
+      <div style="font-size:13px">
+        <div v-if="cmdStats.length === 0" style="color:#ccc;padding:10px">暂无数据</div>
+        <div v-for="(c,i) in cmdStats" :key="i" style="display:inline-block;padding:4px 12px;margin:4px;background:#f5f6fa;border-radius:6px">
+          <span style="color:#e67e22">{{ c.command }}</span>
+          <strong style="color:#333;margin-left:4px">{{ c.count }}</strong>
+        </div>
+      </div>
+    </div>
     <!-- 实时消息 -->
     <div class="card">
       <h3>实时消息 <small style="font-weight:normal;color:#999;font-size:12px">(SSE)</small></h3>
@@ -60,12 +71,14 @@ import api from '@/api'
 const accounts = ref<any[]>([])
 const stats = reactive({ messages_received: 0, tokens_used: 0, active_sessions: 0 })
 const messages = ref<any[]>([])
+const cmdStats = ref<any[]>([])
 const feed = ref<HTMLElement>()
 let eventSource: EventSource | null = null
 let pollTimer: ReturnType<typeof setInterval> | null = null
 
 onMounted(async () => {
   await refreshData()
+  fetchCmdStats()
 
   eventSource = new EventSource('/api/system/events/stream')
   eventSource.addEventListener('message', (e) => {
@@ -80,8 +93,8 @@ onMounted(async () => {
     if (acc) acc.status = data.status
   })
 
-  // Auto-refresh stats every 30s
-  pollTimer = setInterval(refreshStats, 30000)
+  // Auto-refresh stats and cmd logs every 30s
+  pollTimer = setInterval(() => { refreshStats(); fetchCmdStats() }, 30000)
 })
 
 onUnmounted(() => {
@@ -108,6 +121,13 @@ async function refreshStats() {
       stats.tokens_used = res.data.today.tokens_used
       stats.active_sessions = res.data.today.active_sessions
     }
+  } catch (e) { /* ignore */ }
+}
+
+async function fetchCmdStats() {
+  try {
+    const res = await api.get('/system/commands') as any
+    cmdStats.value = res.data || []
   } catch (e) { /* ignore */ }
 }
 

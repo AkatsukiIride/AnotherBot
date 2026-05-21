@@ -50,6 +50,7 @@ def deserialize_event(event_json: str) -> AstrMessageEvent:
         group_id=msg_data.get("group_id"),
         sender=sender,
         is_at_bot=msg_data.get("is_at_bot", False),
+        image_url=msg_data.get("image_url"),
         raw_message=msg_data.get("raw_message"),
     )
     return AstrMessageEvent(

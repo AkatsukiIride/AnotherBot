@@ -101,6 +101,16 @@ async def get_logs(level: str = None, limit: int = 100):
     return {"ok": True, "data": lines[-limit:]}
 
 
+@router.get("/commands")
+async def get_command_stats():
+    db = get_db()
+    rows = db.execute(
+        "SELECT command, COUNT(*) as count FROM command_logs GROUP BY command ORDER BY count DESC"
+    ).fetchall()
+    db.close()
+    return {"ok": True, "data": [{"command": r['command'], "count": r['count']} for r in rows]}
+
+
 @router.get("/events/stream")
 async def sse_stream():
     """Server-Sent Events for Dashboard live feed"""

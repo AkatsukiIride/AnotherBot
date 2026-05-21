@@ -25,6 +25,7 @@ class MessageQueue:
                     "name": event.message.sender.name,
                 } if event.message.sender else None,
                 "is_at_bot": event.message.is_at_bot,
+                "image_url": event.message.image_url,
                 "raw_message": event.message.raw_message,
             },
             "created_at": event.created_at.isoformat(),

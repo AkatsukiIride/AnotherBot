@@ -11,6 +11,7 @@ class AppConfig:
     secret_key: str = ""
     log_level: str = "INFO"
     sticker_limit: int = 500
+    pixiv_token: str = ""
 
 
 def load_config() -> AppConfig:
@@ -22,4 +23,5 @@ def load_config() -> AppConfig:
         secret_key=os.environ.get("ANOTHERBOT_SECRET_KEY", ""),
         log_level=os.environ.get("ANOTHERBOT_LOG_LEVEL", "INFO"),
         sticker_limit=int(os.environ.get("ANOTHERBOT_STICKER_LIMIT", "500")),
+        pixiv_token=os.environ.get("ANOTHERBOT_PIXIV_TOKEN", ""),
     )

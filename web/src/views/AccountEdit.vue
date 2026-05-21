@@ -27,8 +27,8 @@
           </template>
           <!-- B站 配置 -->
           <template v-if="form.platform_id === 'bilibili'">
-            <label>SESSDATA</label>
-            <input v-model="config.sessdata" placeholder="从B站Cookie复制" />
+            <label>SESSDATA <small style="color:#999">(F12→Application→Cookies→bilibili.com)</small></label>
+            <input v-model="config.sessdata" placeholder="从浏览器Cookie复制" />
             <label>bili_jct</label>
             <input v-model="config.bili_jct" placeholder="CSRF Token" />
             <label>buvid3</label>
