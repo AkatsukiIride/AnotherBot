@@ -30,6 +30,16 @@ class MessageRouter:
         self.llm = llm_client
         self.cmd_parser = command_parser
         self.adapters = adapter_manager
+        self._prompt_cache: dict[str, str] = {}
+
+    def invalidate_prompt_cache(self, persona_id: str = None):
+        """Clear cached system prompts. If persona_id given, only clear that persona."""
+        if persona_id:
+            prefix = f"{persona_id}:"
+            self._prompt_cache = {k: v for k, v in self._prompt_cache.items()
+                                  if not k.startswith(prefix)}
+        else:
+            self._prompt_cache.clear()
 
     async def route(self, event: AstrMessageEvent) -> None:
         # 1. Check for command
@@ -130,25 +140,32 @@ class MessageRouter:
 
         context_msgs = await self.ctx.build_context(session, max_turns, ttl_minutes)
 
-        # 7. System prompt — with platform-specific constraints
+        # 7. System prompt — cached (persona + stickers), platform-specific constraints
         platform_key = event.platform
         if event.platform == "bilibili" and event.message.raw_message:
             bili_source = event.message.raw_message.get('_bili_source', 'live')
             platform_key = f"bilibili_{bili_source}"
-        system_prompt = self.persona.build_system_prompt(persona, platform_key)
-        # Inject sticker list into <!-- STICKERS --> or <!-- STICKERS:EM0001,EM0002 --> placeholders
-        import re
-        def replace_sticker_block(m):
-            spec = m.group(1)  # None or ":EM0001,EM0002"
-            codes = None
-            if spec:
-                codes = [c.strip() for c in spec.lstrip(':').split(',') if c.strip().startswith('EM')]
-            hint = self._build_sticker_hint(codes)
-            return hint if hint else "\n\n(当前没有可用表情包，请勿引用任何表情包编号)"
-        system_prompt = re.sub(
-            r'<!-- STICKERS(:[A-Z0-9,]+)? -->',
-            replace_sticker_block, system_prompt
-        )
+        from datetime import datetime
+        cache_key = f"{persona.id}:{platform_key}:{datetime.now().strftime('%Y%m%d')}"
+        if cache_key in self._prompt_cache:
+            system_prompt = self._prompt_cache[cache_key]
+        else:
+            system_prompt = self.persona.build_system_prompt(persona, platform_key)
+            import re
+            def replace_sticker_block(m):
+                spec = m.group(1)
+                codes = None
+                if spec:
+                    codes = [c.strip() for c in spec.lstrip(':').split(',') if c.strip().startswith('EM')]
+                hint = self._build_sticker_hint(codes)
+                return hint if hint else "\n\n(当前没有可用表情包，请勿引用任何表情包编号)"
+            system_prompt = re.sub(
+                r'<!-- STICKERS(:[A-Z0-9,]+)? -->',
+                replace_sticker_block, system_prompt
+            )
+            self._prompt_cache[cache_key] = system_prompt
+            if len(self._prompt_cache) > 50:
+                self._prompt_cache.pop(next(iter(self._prompt_cache)))
 
         # Inject user memories and learned examples into system prompt
         memory_hint = self._build_memory_hint(account)

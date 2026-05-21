@@ -171,6 +171,7 @@ async def shutdown():
     logger = logging.getLogger("anotherbot")
     logger.info("Shutting down...")
     await adapter_mgr.shutdown_all()
+    await llm_client.close()
     logger.info("AnotherBot stopped")
 
 
